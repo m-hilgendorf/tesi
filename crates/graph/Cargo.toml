@@ -1,0 +1,9 @@
+[package]
+name = "tesi-graph"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+crossbeam = { workspace = true }
+tesi-util = { workspace = true }
+triple_buffer = { workspace = true }
