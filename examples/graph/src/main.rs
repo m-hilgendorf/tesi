@@ -27,10 +27,6 @@ impl graph::proc::Processor for Sine {
 
     fn process(&mut self, context: &mut graph::proc::Context<'_>) {
         let output = &mut context.audio_outputs[0];
-        for channel in 0..output.num_channels() {
-            let channel = output[channel].as_ptr();
-            eprintln!("writing to {channel:x?}");
-        }
         for sample in 0..output.num_frames() {
             let sine = (self.phase * std::f32::consts::TAU).sin();
             self.phase = (self.phase + self.freq / self.sample_rate).fract();
@@ -53,9 +49,6 @@ impl graph::proc::Processor for Sum {
         output.clear();
         for input in context.audio_inputs {
             for channel in 0..input.num_channels() {
-                let input_channel = input[channel].as_ptr();
-                let output_channel = output[channel].as_ptr();
-                eprintln!("adding {input_channel:x?} to {output_channel:x?}");
                 for (i, o) in input[channel].iter().zip(output[channel].iter_mut()) {
                     *o += *i;
                 }

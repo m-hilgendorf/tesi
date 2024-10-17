@@ -127,17 +127,12 @@ pub(crate) fn compile(
 
                     for channel_index in 0..output_bus.num_channels() {
                         let ptr = alloc.alloc();
-                        eprintln!("output: {node_index}.{bus_index}.{channel_index} {ptr:x?}");
                         *output_bus.ptrs[channel_index].get() = ptr;
                     }
                     if let Some(input) = outgoing {
                         let input_node = &nodes[input.0];
                         let input_bus = &mut *(*input_node.audio_inputs.get())[input.1].get();
                         output_bus.push(input_bus);
-                        for (channel_index, ptr) in input_bus.ptrs.iter().enumerate() {
-                            let ptr = *ptr.get();
-                            eprintln!("push {node_index}.{bus_index}.{channel_index} -> {}.{}.{channel_index} {ptr:x?}", input.0, input.1)
-                        }
                     } else {
                         for ptr in &output_bus.ptrs {
                             let ptr = *ptr.get();
