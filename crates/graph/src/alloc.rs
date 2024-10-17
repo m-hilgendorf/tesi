@@ -64,18 +64,26 @@ impl<T> SlabAllocator<T> {
     }
 
     pub fn alloc(&mut self) -> *mut T {
-        if let Some(ptr) = self.pointers.pop() {
-            return ptr;
-        }
-        self.data.reserve_exact(self.slab_size);
-        unsafe {
-            let ptr = self.data.as_mut_ptr().add(self.data.len());
-            self.data.set_len(self.data.len() + self.slab_size);
-            ptr.cast()
-        }
+        let ptr = 'a: {
+            if let Some(ptr) = self.pointers.pop() {
+                break 'a ptr;
+            }
+            self.data.reserve_exact(self.slab_size);
+            unsafe {
+                let ptr = self.data.as_mut_ptr().add(self.data.len());
+                self.data.set_len(self.data.len() + self.slab_size);
+                ptr.cast()
+            }
+        };
+        debug_assert!(ptr.is_aligned());
+        ptr
     }
 
     pub fn dealloc(&mut self, ptr: *mut T) {
+        debug_assert!(
+            ptr.is_aligned() && !ptr.is_null(),
+            "expected an aligned and non-null pointer: {ptr:x?}"
+        );
         self.pointers.push(ptr);
     }
 }
@@ -90,37 +98,49 @@ pub(crate) fn compile(
     let mut alloc: SlabAllocator<f32> = SlabAllocator::new(max_num_frames);
     let mut max_breadth = 0;
     unsafe {
-        let mut breadth = 0;
-        for (index, node) in nodes.iter().enumerate() {
-            if index != input_node {
-                for (index, incoming) in node.incoming.iter().enumerate() {
-                    let bus = &mut *(*node.audio_inputs.get())[index].get();
-                    breadth += bus.ptrs.len();
+        for (node_index, node) in nodes.iter().enumerate() {
+            let mut breadth = 0;
+            if node_index != input_node {
+                for (bus_index, incoming) in node.incoming.iter().enumerate() {
+                    let bus = &mut *(*node.audio_inputs.get())[bus_index].get();
+                    breadth += bus.num_channels();
 
-                    for channel in 0..bus.ptrs.len() {
+                    for channel_index in 0..bus.num_channels() {
                         if incoming.is_none() {
                             let ptr = alloc.alloc();
                             for n in 0..max_num_frames {
                                 std::ptr::write(ptr.add(n), 0.0);
                             }
-                            *bus.ptrs[channel].get() = ptr.cast();
+                            *bus.ptrs[channel_index].get() = ptr.cast();
                         }
-                        let ptr = *bus.ptrs[channel].get();
+                        let ptr = *bus.ptrs[channel_index].get();
+                        eprintln!("input: {node_index}.{bus_index}.{channel_index} {ptr:x?}");
                         alloc.dealloc(ptr.cast_mut());
                     }
                 }
             }
 
-            if index != output_node {
-                for (index, outgoing) in node.outgoing.iter().enumerate() {
-                    let bus = &mut *(*node.audio_outputs.get())[index].get();
-                    breadth += bus.ptrs.len();
+            if node_index != output_node {
+                for (bus_index, outgoing) in node.outgoing.iter().enumerate() {
+                    let output_bus = &mut *(*node.audio_outputs.get())[bus_index].get();
+                    breadth += output_bus.num_channels();
 
-                    for channel in 0..bus.ptrs.len() {
+                    for channel_index in 0..output_bus.num_channels() {
                         let ptr = alloc.alloc();
-                        *bus.ptrs[channel].get() = ptr;
-
-                        if outgoing.is_none() {
+                        eprintln!("output: {node_index}.{bus_index}.{channel_index} {ptr:x?}");
+                        *output_bus.ptrs[channel_index].get() = ptr;
+                    }
+                    if let Some(input) = outgoing {
+                        let input_node = &nodes[input.0];
+                        let input_bus = &mut *(*input_node.audio_inputs.get())[input.1].get();
+                        output_bus.push(input_bus);
+                        for (channel_index, ptr) in input_bus.ptrs.iter().enumerate() {
+                            let ptr = *ptr.get();
+                            eprintln!("push {node_index}.{bus_index}.{channel_index} -> {}.{}.{channel_index} {ptr:x?}", input.0, input.1)
+                        }
+                    } else {
+                        for ptr in &output_bus.ptrs {
+                            let ptr = *ptr.get();
                             for n in 0..max_num_frames {
                                 std::ptr::write(ptr.add(n), 0.0);
                             }

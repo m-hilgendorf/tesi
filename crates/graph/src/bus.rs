@@ -8,12 +8,12 @@ use tesi_util::IsSendSync;
 
 pub struct AudioBus {
     pub(crate) num_frames: usize,
-    pub(crate) ptrs: Box<[IsSendSync<UnsafeCell<*const f32>>]>,
+    pub(crate) ptrs: Vec<IsSendSync<UnsafeCell<*const f32>>>,
 }
 
 pub struct AudioBusMut {
     pub(crate) num_frames: usize,
-    pub(crate) ptrs: Box<[IsSendSync<UnsafeCell<*mut f32>>]>,
+    pub(crate) ptrs: Vec<IsSendSync<UnsafeCell<*mut f32>>>,
 }
 
 pub struct Iter<'a> {
@@ -33,14 +33,19 @@ impl AudioBus {
         for _ in 0..num_channels {
             ptrs.push(IsSendSync::new(UnsafeCell::new(null())));
         }
-        Self {
-            num_frames,
-            ptrs: ptrs.into_boxed_slice(),
-        }
+        Self { num_frames, ptrs }
     }
 
     pub fn iter(&self) -> Iter<'_> {
         Iter { bus: self, idx: 0 }
+    }
+
+    pub fn num_frames(&self) -> usize {
+        self.num_frames
+    }
+
+    pub fn num_channels(&self) -> usize {
+        self.ptrs.len()
     }
 }
 
@@ -51,22 +56,51 @@ impl AudioBusMut {
         for _ in 0..num_channels {
             ptrs.push(IsSendSync::new(UnsafeCell::new(null_mut())));
         }
-        Self {
-            num_frames,
-            ptrs: ptrs.into_boxed_slice(),
+        Self { num_frames, ptrs }
+    }
+
+    pub(crate) unsafe fn push(&self, dst: &mut AudioBus) {
+        debug_assert_eq!(self.num_channels(), dst.num_channels());
+        for (src, dst) in self.ptrs.iter().zip(dst.ptrs.iter()) {
+            let ptr = *src.get();
+            debug_assert!(
+                ptr.is_aligned() && !ptr.is_null(),
+                "expected a non-null and aligned pointer: {ptr:x?}"
+            );
+            *dst.get() = ptr.cast();
         }
     }
 
-    pub(crate) unsafe fn push(&self, other: &AudioBus) {
-        debug_assert_eq!(self.ptrs.len(), other.ptrs.len());
-        let src = self.ptrs.as_ptr().cast();
-        let dst = other.ptrs.as_ptr().cast_mut();
-        let count = self.ptrs.len() * std::mem::size_of::<*const f32>();
-        std::ptr::copy_nonoverlapping(src, dst, count);
+    pub(crate) unsafe fn pull(&self, dst: &mut AudioBus) {
+        debug_assert_eq!(self.num_channels(), dst.num_channels());
+        for (src, dst) in self.ptrs.iter().zip(dst.ptrs.iter()) {
+            let ptr = *dst.get();
+            debug_assert!(
+                ptr.is_aligned() && !ptr.is_null(),
+                "expected a non-null and aligned pointer: {ptr:x?}"
+            );
+            *src.get() = ptr.cast_mut();
+        }
     }
 
     pub fn iter(&mut self) -> IterMut<'_> {
         IterMut { bus: self, idx: 0 }
+    }
+
+    pub fn num_frames(&self) -> usize {
+        self.num_frames
+    }
+
+    pub fn num_channels(&self) -> usize {
+        self.ptrs.len()
+    }
+
+    pub fn clear(&mut self) {
+        for channel in self.iter() {
+            for sample in channel {
+                *sample = 0.0;
+            }
+        }
     }
 }
 
@@ -129,7 +163,9 @@ impl<'a> Iterator for IterMut<'a> {
             return None;
         }
         let buffer = unsafe {
-            let data = *self.bus.ptrs[self.idx].get();
+            let ptr = self.bus.ptrs[self.idx].get();
+            debug_assert!(ptr.is_aligned());
+            let data = *ptr;
             let len = self.bus.num_frames;
             std::slice::from_raw_parts_mut(data, len)
         };

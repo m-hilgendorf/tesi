@@ -199,7 +199,7 @@ impl Graph {
         {
             let mut inner_ = inner.write().unwrap();
             let renderer = Renderer {
-                graph: Arc::downgrade(&inner),
+                graph: Some(Arc::downgrade(&inner)),
                 inner: renderer::Inner::new(options.num_workers, receiver),
                 _p: PhantomData,
             };
@@ -211,13 +211,13 @@ impl Graph {
 
         // Create the input and output nodes.
         let input_options = node::Options {
-            audio_inputs: vec![options.num_input_channels],
-            audio_outputs: vec![],
+            audio_inputs: vec![],
+            audio_outputs: vec![options.num_input_channels],
         };
         let input_node = Node::new(&graph, input_options, InputNode);
         let output_options = node::Options {
-            audio_inputs: vec![],
-            audio_outputs: vec![options.num_output_channels],
+            audio_inputs: vec![options.num_output_channels],
+            audio_outputs: vec![],
         };
         let output_node = Node::new(&graph, output_options, OutputNode);
         {
@@ -230,7 +230,10 @@ impl Graph {
     }
 
     pub fn renderer(&self) -> Option<renderer::Renderer> {
-        self.inner.write().unwrap().renderer.clone().take()
+        let graph = Arc::downgrade(&self.inner);
+        let mut renderer = self.inner.write().unwrap().renderer.clone().take()?;
+        renderer.graph.replace(graph);
+        Some(renderer)
     }
 
     pub fn commit_changes(&self) {
@@ -239,11 +242,14 @@ impl Graph {
 
         // Sort topologically with BFS to remap nodes to indices.
         let mut indices = BTreeMap::new();
-        let sources = std::iter::once(0)
-            .chain(graph.nodes.iter().enumerate().filter_map(|(index, node)| {
+        let sources = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
                 let node = node.as_ref()?;
                 node.incoming.is_empty().then_some(index)
-            }))
+            })
             .collect::<Vec<_>>();
         let mut queue: VecDeque<_> = sources.clone().into();
         while let Some(node) = queue.pop_front() {
@@ -252,14 +258,19 @@ impl Graph {
             }
             let index = indices.len();
             indices.insert(node, index);
-            let adjacent = graph.nodes[node]
-                .as_ref()
-                .unwrap()
+            let node = graph.nodes[node].as_ref().unwrap();
+            let adjacent = node
                 .outgoing
                 .iter()
                 .flatten()
-                .map(|(node, _)| *node);
+                .map(|(node, _)| *node)
+                .collect::<Vec<_>>();
             queue.extend(adjacent);
+        }
+
+        // Make sure the output node is present.
+        if !indices.contains_key(&1) {
+            indices.insert(1, indices.len());
         }
 
         // Get the input and output nodes.
@@ -267,15 +278,38 @@ impl Graph {
         let output_node = *indices.get(&1).unwrap();
 
         // Create the renderer state for each node.
-        let mut indices = indices.into_iter().collect::<Vec<_>>();
-        indices.sort_unstable_by_key(|(_, new)| *new);
-        let nodes = indices
+        let mut sorted_indices = indices.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
+        sorted_indices.sort_unstable_by_key(|(_, new)| *new);
+        let nodes = sorted_indices
             .into_iter()
             .map(|(old, _)| {
-                let old = graph.nodes[old].as_ref().unwrap();
-                let incoming = old.incoming.clone().into_boxed_slice();
-                let outgoing = old.outgoing.clone().into_boxed_slice();
-                let audio_inputs = old
+                let data = graph.nodes[old].as_ref().unwrap();
+                let incoming = data
+                    .incoming
+                    .iter()
+                    .map(|old| {
+                        let Some(old) = old else {
+                            return None;
+                        };
+                        let new = (*indices.get(&old.0).unwrap(), old.1);
+                        Some(new)
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+
+                let outgoing = data
+                    .outgoing
+                    .iter()
+                    .map(|old| {
+                        let Some(old) = old else {
+                            return None;
+                        };
+                        let new = (*indices.get(&old.0).unwrap(), old.1);
+                        Some(new)
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let audio_inputs = data
                     .options
                     .audio_inputs
                     .iter()
@@ -284,11 +318,11 @@ impl Graph {
                         let bus = AudioBus::new(num_channels);
                         IsSendSync::new(UnsafeCell::new(bus))
                     })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
+                    .collect::<Vec<_>>();
+
                 let audio_inputs = IsSendSync::new(UnsafeCell::new(audio_inputs));
 
-                let audio_outputs = old
+                let audio_outputs = data
                     .options
                     .audio_outputs
                     .iter()
@@ -297,16 +331,17 @@ impl Graph {
                         let bus = AudioBusMut::new(num_channels);
                         IsSendSync::new(UnsafeCell::new(bus))
                     })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
+                    .collect::<Vec<_>>();
+
                 let audio_outputs = IsSendSync::new(UnsafeCell::new(audio_outputs));
                 renderer::Node {
+                    _id: old,
                     audio_inputs,
                     audio_outputs,
                     num_bound_inputs: AtomicUsize::new(0),
                     incoming,
                     outgoing,
-                    processor: old.processor.clone(),
+                    processor: data.processor.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -384,7 +419,7 @@ impl Inner {
             .ok_or(Error::InvalidPort)?
             .is_some()
             || sink_
-                .outgoing
+                .incoming
                 .get(input)
                 .ok_or(Error::InvalidPort)?
                 .is_some()
@@ -419,6 +454,10 @@ impl Inner {
             );
         }
 
+        // Update the node data.
+        self.nodes[source].as_mut().unwrap().outgoing[output].replace((sink, input));
+        self.nodes[sink].as_mut().unwrap().incoming[input].replace((source, output));
+
         Ok(())
     }
 
@@ -431,40 +470,21 @@ impl Inner {
 impl Processor for InputNode {
     fn initialize(&mut self, _sample_rate: f64, _max_num_frames: usize) {}
 
-    fn process(&mut self, context: &mut crate::proc::Context<'_>) {
-        let input = &context.audio_inputs[0];
-        for output in context.audio_outputs.iter_mut() {
-            for (output, input) in output.iter().zip(input.iter()) {
-                output.copy_from_slice(input);
-            }
-        }
-    }
+    fn process(&mut self, _context: &mut crate::proc::Context<'_>) {}
 
     fn reset(&mut self) {}
 }
 
 impl Processor for OutputNode {
     fn initialize(&mut self, _sample_rate: f64, _max_num_frames: usize) {}
-
-    fn process(&mut self, context: &mut crate::proc::Context<'_>) {
-        let output = &mut context.audio_outputs[0];
-        for output in output {
-            for sample in output {
-                *sample = 0.0;
-            }
-        }
-
-        for input in context.audio_inputs.iter() {
-            for (input, output) in input.iter().zip(context.audio_outputs[0].iter()) {
-                for idx in 0..input.len() {
-                    output[idx] += input[idx];
-                }
-            }
-        }
-    }
-
+    fn process(&mut self, _context: &mut crate::proc::Context<'_>) {}
     fn reset(&mut self) {}
 }
 
 unsafe impl Send for Inner {}
 unsafe impl Sync for Inner {}
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.renderer.take();
+    }
+}

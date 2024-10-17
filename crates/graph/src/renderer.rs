@@ -20,7 +20,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct Renderer {
-    pub(crate) graph: Weak<RwLock<graph::Inner>>,
+    pub(crate) graph: Option<Weak<RwLock<graph::Inner>>>,
     pub(crate) inner: Arc<Inner>,
     pub(crate) _p: PhantomData<*mut ()>,
 }
@@ -44,6 +44,7 @@ pub(crate) struct State {
 }
 
 pub(crate) struct Node {
+    pub(crate) _id: usize,
     pub(crate) audio_inputs: AudioInputs,
     pub(crate) audio_outputs: AudioOutputs,
     pub(crate) num_bound_inputs: AtomicUsize,
@@ -52,8 +53,8 @@ pub(crate) struct Node {
     pub(crate) processor: Arc<IsSendSync<UnsafeCell<dyn Processor>>>,
 }
 
-type AudioInputs = IsSendSync<UnsafeCell<Box<[IsSendSync<UnsafeCell<AudioBus>>]>>>;
-type AudioOutputs = IsSendSync<UnsafeCell<Box<[IsSendSync<UnsafeCell<AudioBusMut>>]>>>;
+type AudioInputs = IsSendSync<UnsafeCell<Vec<IsSendSync<UnsafeCell<AudioBus>>>>>;
+type AudioOutputs = IsSendSync<UnsafeCell<Vec<IsSendSync<UnsafeCell<AudioBusMut>>>>>;
 
 const WORKER_EXIT: usize = 0;
 const WORKER_PARK: usize = 1;
@@ -151,20 +152,44 @@ impl Inner {
         // Bind inputs.
         let input_node = &state.nodes[state.input_node];
         unsafe {
-            let input_bus = &*(*input_node.audio_inputs.get())[0].get();
-            debug_assert_eq!(num_inputs, input_bus.ptrs.len());
-            for index in 0..num_inputs {
-                *input_bus.ptrs[index].get() = *inputs.add(index);
+            if !(*input_node.audio_outputs.get()).is_empty() {
+                // Copy input pointers.
+                let output_bus = &mut *(*input_node.audio_outputs.get())[0].get();
+                debug_assert_eq!(num_inputs, output_bus.ptrs.len());
+                for index in 0..num_inputs {
+                    let ptr = (*inputs.add(index)).cast_mut();
+                    debug_assert!(ptr.is_aligned());
+                    *output_bus.ptrs[index].get() = ptr;
+                }
+
+                // Bind.
+                if let Some((node_index, bus_index)) = input_node.outgoing[0] {
+                    let input_bus =
+                        &mut *(*state.nodes[node_index].audio_inputs.get())[bus_index].get();
+                    output_bus.push(input_bus);
+                }
             }
         }
 
         // Bind outputs.
         let output_node = &state.nodes[state.output_node];
         unsafe {
-            let output_bus = &*(*output_node.audio_outputs.get())[0].get();
-            debug_assert_eq!(num_inputs, output_bus.ptrs.len());
-            for index in 0..num_outputs {
-                *output_bus.ptrs[index].get() = *outputs.add(index);
+            if !(*output_node.audio_inputs.get()).is_empty() {
+                // Copy output pointers.
+                let input_bus = &mut *(*output_node.audio_inputs.get())[0].get();
+                debug_assert_eq!(num_outputs, input_bus.ptrs.len());
+                for index in 0..num_outputs {
+                    let ptr = *outputs.add(index);
+                    debug_assert!(ptr.is_aligned());
+                    *input_bus.ptrs[index].get() = ptr;
+                }
+
+                // Bind to inputs.
+                if let Some((node_index, bus_index)) = output_node.incoming[0] {
+                    let output_bus =
+                        &mut *(*state.nodes[node_index].audio_outputs.get())[bus_index].get();
+                    output_bus.pull(input_bus);
+                }
             }
         }
 
@@ -229,10 +254,10 @@ impl Inner {
 }
 
 impl Node {
-    unsafe fn process_single_threaded(&self, current_num_frames: usize, nodes: &[Node]) {
+    unsafe fn process_single_threaded(&self, current_num_frames: usize, _nodes: &[Node]) {
         // Get the i/o buffers.
-        let audio_inputs: &mut [_] = &mut *self.audio_inputs.get();
-        let audio_outputs: &mut [_] = &mut *self.audio_outputs.get();
+        let audio_inputs = (*self.audio_inputs.get()).as_mut_slice();
+        let audio_outputs = (*self.audio_outputs.get()).as_mut_slice();
 
         // Update the current number of frames.
         for input in audio_inputs.iter_mut() {
@@ -255,15 +280,6 @@ impl Node {
 
         // Process.
         (*self.processor.get()).process(&mut context);
-
-        // Push outputs to inputs.
-        for (output, outgoing) in self.outgoing.iter().copied().enumerate() {
-            if let Some((node, input)) = outgoing {
-                let output = &*(*self.audio_outputs.get())[output].get();
-                let input = &*(*nodes[node].audio_inputs.get())[input].get();
-                output.push(input);
-            }
-        }
     }
 
     unsafe fn process_multi_threaded(
@@ -275,7 +291,7 @@ impl Node {
     ) {
         // Assign unbound input buffers.
         for (input, incoming) in self.incoming.iter().copied().enumerate() {
-            if incoming.is_none() {
+            if incoming.is_none() && input != 0 {
                 let bus = &*(*self.audio_inputs.get())[input].get();
                 alloc.assign(bus);
             }
@@ -318,8 +334,10 @@ impl Node {
         for (output, outgoing) in self.outgoing.iter().copied().enumerate() {
             let output = &*(*self.audio_outputs.get())[output].get();
             if let Some((node, input)) = outgoing {
-                let input = &*(*nodes[node].audio_inputs.get())[input].get();
-                output.push(input);
+                let input = &mut *(*nodes[node].audio_inputs.get())[input].get();
+                if node != 1 {
+                    output.push(input);
+                }
 
                 if nodes[node].num_bound_inputs.fetch_add(1, Ordering::Relaxed)
                     == (*nodes[node].audio_inputs.get()).len()
@@ -359,17 +377,18 @@ unsafe impl Send for Renderer {}
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        let Some(graph) = self.graph.upgrade() else {
+        let Some(graph) = self.graph.take().and_then(|graph| graph.upgrade()) else {
             return;
         };
         let Some(mut graph) = graph.write().ok() else {
             return;
         };
-        graph.renderer.replace(Renderer {
+        let _existing = graph.renderer.replace(Renderer {
             graph: self.graph.clone(),
             inner: self.inner.clone(),
             _p: PhantomData,
         });
+        drop(graph);
     }
 }
 
