@@ -41,13 +41,14 @@ pub(crate) struct State {
     pub(crate) output_node: usize,
     pub(crate) sources: Vec<usize>,
     pub(crate) _data: Vec<MaybeUninit<f32>>,
+    pub(crate) counter: AtomicUsize,
 }
 
 pub(crate) struct Node {
     pub(crate) _id: usize,
     pub(crate) audio_inputs: AudioInputs,
     pub(crate) audio_outputs: AudioOutputs,
-    pub(crate) num_bound_inputs: AtomicUsize,
+    pub(crate) indegree: AtomicUsize,
     pub(crate) incoming: Box<[Option<(usize, usize)>]>,
     pub(crate) outgoing: Box<[Option<(usize, usize)>]>,
     pub(crate) processor: Arc<IsSendSync<UnsafeCell<dyn Processor>>>,
@@ -216,9 +217,17 @@ impl Inner {
         while let Some(node) = state.queue.pop() {
             let node = &state.nodes[node];
             unsafe {
-                node.process_multi_threaded(num_frames, &state.nodes, &state.alloc, &state.queue);
+                node.process_multi_threaded(num_frames, &state.nodes, &state.alloc, &state.queue, &state.counter);
             }
         }
+
+        // Spin until other threads complete, hopefully for a very short amount of time.
+        while state.counter.load(Ordering::Relaxed) < state.nodes.len() {
+            continue;
+        }
+
+        // Reset.
+        state.counter.store(0, Ordering::Relaxed);
 
         // Signal other threads to spin.
         self.worker_state.store(WORKER_SPIN, Ordering::Relaxed);
@@ -245,6 +254,7 @@ impl Inner {
                         &state.nodes,
                         &state.alloc,
                         &state.queue,
+                        &state.counter,
                     );
                 },
                 _ => unreachable!(),
@@ -288,6 +298,7 @@ impl Node {
         nodes: &[Node],
         alloc: &Allocator,
         queue: &ArrayQueue<usize>,
+        counter: &AtomicUsize
     ) {
         // Assign unbound input buffers.
         for (input, incoming) in self.incoming.iter().copied().enumerate() {
@@ -328,7 +339,10 @@ impl Node {
             let bus = &*(*self.audio_inputs.get())[input].get();
             alloc.release(bus);
         }
-        self.num_bound_inputs.store(0, Ordering::Relaxed);
+
+        // Reset the indegree of this node.
+        let max_indegree = (*self.audio_inputs.get()).len();
+        self.indegree.store(max_indegree, Ordering::Relaxed);
 
         // Push outputs to inputs or release unbound outputs.
         for (output, outgoing) in self.outgoing.iter().copied().enumerate() {
@@ -339,15 +353,19 @@ impl Node {
                     output.push(input);
                 }
 
-                if nodes[node].num_bound_inputs.fetch_add(1, Ordering::Relaxed)
-                    == (*nodes[node].audio_inputs.get()).len()
+                // Decrement the indegree of the next node and add to the queue.
+                if nodes[node].indegree.fetch_sub(1, Ordering::Relaxed) == 0
                 {
                     queue.push(node).unwrap();
                 }
             } else {
+                // Release unbound output buffers.
                 alloc.release_mut(output);
             }
         }
+
+        // Increment the counter.
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -368,6 +386,7 @@ impl State {
             input_node: 0,
             output_node: 0,
             sources: vec![],
+            counter: AtomicUsize::new(0),
             _data: vec![],
         }
     }

@@ -338,7 +338,7 @@ impl Graph {
                     _id: old,
                     audio_inputs,
                     audio_outputs,
-                    num_bound_inputs: AtomicUsize::new(0),
+                    indegree: AtomicUsize::new(0),
                     incoming,
                     outgoing,
                     processor: data.processor.clone(),
@@ -361,6 +361,7 @@ impl Graph {
             input_node,
             output_node,
             sources,
+            counter: AtomicUsize::new(0),
             _data: data,
         };
 
