@@ -7,46 +7,48 @@ This note covers the basic logic for the multithreaded audio graph rendering alg
 Here is a simplified example of an audio graph that uses [Kahn's algorithm](https://en.wikipedia.org/wiki/Topological_sorting#Kahn's_algorithm) to walk the graph in topological order. The idea is that we keep some state around for each graph node, its `indegree`, which represents the number of incoming edges that have not yet been walked. When this count hits `0`, all of the node's dependencies have been processed and it can be added to the queue.
 
 ```rs
+use std::collections::VecDeque;
 struct Graph {
   nodes: Vec<Node>,
-  queue: VecDequeue<usize>,
+  queue: VecDeque<usize>,
 }
 
 struct Node {
   incoming: Vec<usize>,
-  outgoing: Vec<usize>
+  outgoing: Vec<usize>,
   indegree: usize,
   process: Box<dyn FnMut() -> ()>,
 }
 
 impl Graph {
-  // Called once per cycle ro render the graph.
+  // Called once per cycle to render the graph.
   fn process(&mut self) {
     // Get the list of roots, nodes with indegree 0.
-    let roots = nodes
+    let roots = self
+      .nodes
       .iter()
       .enumerate()
-      .filter_map(|(index, node)| node.indegree == 0);
+      .filter_map(|(index, node)| (node.indegree == 0).then_some(index));
 
     // Clear and push the roots to the quuee.
-    queue.clear();
-    queue.extend(roots);
+    self.queue.clear();
+    self.queue.extend(roots);
 
     // Drain the queue and process the nodes along the way.
-    while let Some(node) = queue.pop_front() {
+    while let Some(node) = self.queue.pop_front() {
       // Process the node.
-      nodes[node].process();
+      (self.nodes[node].process)();
 
       // Reset the node's indegree.
-      nodes[node].indegree = nodes[node].incoming.len();
+      self.nodes[node].indegree = self.nodes[node].incoming.len();
 
       // Decrement the indegree of any neighbors.
-      for node in &nodes[node].outgoing {
-        nodes[*node].indegree -= 1;
+      for node in self.nodes[node].outgoing.clone() {
+        self.nodes[node].indegree -= 1;
 
         // If the neighbor's indegree hits zero, add it to the back of the queue.
-        if nodes[*node].indegree == 0 {
-          queue.push_back(*node);
+        if self.nodes[node].indegree == 0 {
+          self.queue.push_back(node);
         }
       }
     }
@@ -62,9 +64,9 @@ The reason that Kahn's algorithm is preferable to a depth-first walk of the grap
 - write two variants of `process`, one for the audio thread and one for worker threads.
 
 ```rs
-use crossbeam::ArrayQueue;
-use std::atomic::{AtomicUsize, Ordering};
-use std::sync::UnsafeCell;
+use crossbeam::queue::ArrayQueue;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::UnsafeCell;
 
 struct Graph {
   counter: AtomicUsize,
@@ -74,7 +76,7 @@ struct Graph {
 
 struct Node {
   indegree: AtomicUsize,
-  incoming: Vec<usize>
+  incoming: Vec<usize>,
   outgoing: Vec<usize>,
   process: Box<dyn FnMut() -> ()>,
 }
@@ -85,7 +87,7 @@ unsafe impl Sync for Graph {}
 impl Graph {
   fn audio_thread(&self) {
     // Set the counter to 0.
-    self.counter.store(self.nodes.len())
+    self.counter.store(self.nodes.len(), Ordering::Relaxed);
 
     // Get the roots.
     unsafe {
@@ -118,13 +120,13 @@ impl Graph {
    }
   }
 
-  fn process_nodes(self: &self) {
+  fn process_nodes(&self) {
     while let Some(node) = self.queue.pop() {
       // Safety: the algorithm guarantees that whichever thread pops the node index from the queue has exclusive access to that node.
-      let node = &mut unsafe { *self.nodes[node].get() };
+      let node = unsafe { &mut *self.nodes[node].get() };
 
       // Process the node.
-      node.process();
+      (node.process)();
 
       // Reset the node's indegree.
       node.indegree.store(node.incoming.len(), Ordering::Relaxed);
@@ -132,8 +134,8 @@ impl Graph {
       // Decrement the indegree of each neighbor.
       for outgoing in &node.outgoing {
         // Safety: we are only acquiring an immutable reference.
-        let node = & unsafe { *self.nodes[&outgoing].get() };
-        if node.indegree.fetch_sub(1) == 0 {
+        let node = unsafe { &*self.nodes[*outgoing].get() };
+        if node.indegree.fetch_sub(1, Ordering::Relaxed) == 0 {
           // If the indegree hits zero, push the index into the queue.
           self.queue.push(*outgoing).ok();
         }
