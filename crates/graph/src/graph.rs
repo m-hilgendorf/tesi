@@ -6,7 +6,7 @@ use std::{
 };
 
 use crossbeam::queue::ArrayQueue;
-use tesi_util::IsSendSync;
+use util::IsSendSync;
 
 use crate::{
     bus::{AudioBus, AudioBusMut},

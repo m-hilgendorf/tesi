@@ -9,7 +9,7 @@ use std::{
     },
     thread::JoinHandle,
 };
-use tesi_util::IsSendSync;
+use util::IsSendSync;
 
 use crate::{
     alloc::Allocator,
@@ -217,7 +217,13 @@ impl Inner {
         while let Some(node) = state.queue.pop() {
             let node = &state.nodes[node];
             unsafe {
-                node.process_multi_threaded(num_frames, &state.nodes, &state.alloc, &state.queue, &state.counter);
+                node.process_multi_threaded(
+                    num_frames,
+                    &state.nodes,
+                    &state.alloc,
+                    &state.queue,
+                    &state.counter,
+                );
             }
         }
 
@@ -298,7 +304,7 @@ impl Node {
         nodes: &[Node],
         alloc: &Allocator,
         queue: &ArrayQueue<usize>,
-        counter: &AtomicUsize
+        counter: &AtomicUsize,
     ) {
         // Assign unbound input buffers.
         for (input, incoming) in self.incoming.iter().copied().enumerate() {
@@ -354,8 +360,7 @@ impl Node {
                 }
 
                 // Decrement the indegree of the next node and add to the queue.
-                if nodes[node].indegree.fetch_sub(1, Ordering::Relaxed) == 0
-                {
+                if nodes[node].indegree.fetch_sub(1, Ordering::Relaxed) == 0 {
                     queue.push(node).unwrap();
                 }
             } else {

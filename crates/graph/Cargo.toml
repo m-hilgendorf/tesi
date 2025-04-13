@@ -5,5 +5,5 @@ edition = "2021"
 
 [dependencies]
 crossbeam = { workspace = true }
-tesi-util = { workspace = true }
+util = { workspace = true }
 triple_buffer = { workspace = true }
