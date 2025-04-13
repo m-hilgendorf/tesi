@@ -4,6 +4,6 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-crossbeam = { workspace = true }
+buffer = { workspace = true }
 util = { workspace = true }
-triple_buffer = { workspace = true }
+processor = { workspace = true }

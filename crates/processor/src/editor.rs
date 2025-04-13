@@ -1,3 +1,4 @@
+use crate::Port;
 pub use crate::port;
 
 pub trait Editor {
@@ -51,25 +52,6 @@ pub trait Editor {
     fn attach_gui(&mut self, gui: GuiHandle) -> bool {
         false
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct Port {
-    pub name: String,
-    pub direction: Direction,
-    pub kind: PortKind,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub enum Direction {
-    Input,
-    Output,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PortKind {
-    Audio(port::Audio),
-    Event(port::Event),
 }
 
 /// A parameter tree holds the parameters in its leaves.
