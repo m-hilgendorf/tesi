@@ -2,13 +2,18 @@
 members = [
   "crates/buffer",
   "crates/graph",
+  "crates/processor",
   "crates/util"
-  ]
+]
 resolver = "3"
 
 [workspace.dependencies]
+# 3P dependencies
 crossbeam = "0.8"
+triple_buffer = "8"
+
+# internals
 buffer = { package = "tesi-buffer", path = "crates/buffer"}
 graph = { package = "tesi-graph", path = "crates/graph" }
+processor = { package = "tesi-processor", path = "crates/processor" }
 util = { package = "tesi-util", path = "crates/util" }
-triple_buffer = "8"

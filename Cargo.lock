@@ -72,6 +72,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tesi-processor"
+version = "0.1.0"
+dependencies = [
+ "tesi-buffer",
+]
+
+[[package]]
 name = "tesi-util"
 version = "0.1.0"
 
