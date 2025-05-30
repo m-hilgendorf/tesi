@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/batchbuffer",
   "crates/buffer",
   "crates/graph",
   "crates/processor",
@@ -11,8 +12,10 @@ resolver = "3"
 # 3P dependencies
 crossbeam = "0.8"
 triple_buffer = "8"
+ouroboros = "0.18"
 
 # internals
+batchbuffer = { package = "batchbuffer", path = "crates/batchbuffer" }
 buffer = { package = "tesi-buffer", path = "crates/buffer"}
 graph = { package = "tesi-graph", path = "crates/graph" }
 processor = { package = "tesi-processor", path = "crates/processor" }

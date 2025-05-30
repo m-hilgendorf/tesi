@@ -3,7 +3,7 @@ use std::{
     cell::{RefCell, UnsafeCell},
     collections::BTreeSet,
     rc::Rc,
-    sync::Arc,
+    sync::{atomic::AtomicBool, Arc},
 };
 
 pub use crate::edge::Edge;
@@ -14,9 +14,10 @@ pub struct Graph {
     pub(crate) inner: Rc<RefCell<Inner>>,
 }
 
-pub struct Inner {
+pub(crate)struct Inner {
     pub(crate) nodes: Vec<Option<NodeData>>,
     pub(crate) free_list: Vec<usize>,
+    pub(crate) reader: batchbuffer::Reader<RenderMessage>,
 }
 
 pub(crate) struct NodeData {
@@ -29,7 +30,23 @@ pub(crate) struct PortData {
     pub connection: Option<(usize, usize)>,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum RenderMessage {
+    Nop,
+    RemoveNode(u32),
+    ReactivateNode(u32),
+    LatencyChanged(u32, u32)
+}
+
 impl Graph {
+    pub fn latency_changed(&self) {
+
+    }
+
+    pub fn needs_reactivate(&self) {
+
+    }
+
     /// Propagate changes to the graph (new or removed [Node]s and [Edge]s)
     pub fn commit_changes(&self) {
         todo!()
@@ -124,8 +141,8 @@ impl Inner {
 
         // Check if the ports are compatible.
         if output_.port.kind != input_.port.kind
-            && matches!(output_.port.direction, Direction::Output)
-            && matches!(input_.port.direction, Direction::Input)
+            || matches!(output_.port.direction, Direction::Input)
+            || matches!(input_.port.direction, Direction::Output)
         {
             return Err(Error::InvalidPortType);
         }

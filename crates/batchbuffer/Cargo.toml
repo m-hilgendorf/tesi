@@ -1,7 +1,6 @@
 [package]
-name = "tesi-buffer"
+name = "batchbuffer"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-util = { "workspace" = true }

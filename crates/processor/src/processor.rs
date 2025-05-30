@@ -39,14 +39,23 @@ pub struct Activated {
 /// Data returned from [Processor::process].
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Processed {
-    /// The number of frames that the processor was able to consume. A value of -1 means the node may be removed from the graph.
-    pub num_frames: isize,
+    /// A hint that this processor is finished processing.
+    pub state: State,
 
-    /// A hint about the number of future samples that this processor will need to render.
-    pub tail_samples: Option<usize>,
+    /// A hint about the number of future number of frames that this processor will need to render.
+    pub tail_frames: Option<u32>,
+}
 
-    /// The amount of gain reduction applied by the plugin.
-    pub gain: Option<f64>,
+#[derive(Copy, Clone, Debug)]
+pub enum State {
+    Continue = 0,
+    Finished,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::Continue
+    }
 }
 
 pub mod context {
@@ -55,16 +64,16 @@ pub mod context {
 
     pub struct Process<'a> {
         pub sample_rate: f64,
-        pub num_frames: usize,
+        pub num_frames: u32,
         pub audio_inputs: &'a [buffer::Audio],
-        pub audio_outputs: &'a mut [buffer::AudioMut],
+        pub audio_outputs: &'a mut [buffer::Audio],
         pub event_inputs: &'a [buffer::Event],
         pub event_outputs: &'a mut [buffer::Event],
     }
 
     pub struct Activate<'a> {
-        /// A handle to the engine that can be cheaply cloned and called on the audio thread.
-        pub engine: Engine,
+        /// An optional handle to the engine that can be cheaply cloned and called on the audio thread.
+        pub engine: Option<Engine>,
 
         /// The sample rate for processing.
         pub sample_rate: f64,

@@ -1,42 +1,34 @@
 //! Audio buffer types.
 //!
-//! - [Audio]: immutable audio buffer, owned or not-owned.
-//! - [AudioMut]: mutable audio buffer, owend or not-owned.
+//! - [Audio]: immutable audio buffer.
+//! - [AudioMut]: mutable audio buffer.
 //!
 //! The internal structure of these types is designed to allow trivial conversion between [Audio]
 //! and [AudioMut], as well as allow [AudioMut] to `impl AsRef<Audio>`.
-//!
-//! Safety:
-//!
-//! - Typical users will want to use [AudioMut::new] to construct an owned, mutable chunk of multi-
-//!   channel audio.
-//! - Advanced users may want to create [Audio] and [AudioMut] instances that don't own their
-//!   underlying data but do not wish to allocate when re-binding it to other instances, or changing
-//!   the buffer size at run time.
 //!
 use core::f32;
 use std::{
     marker::PhantomData,
     ops::{Index, IndexMut},
-    ptr::NonNull,
+    ptr::{NonNull, null_mut},
 };
 
-#[repr(C)]
-pub struct Audio {
-    pub(crate) num_channels: usize,
-    pub(crate) num_frames: usize,
-    pub(crate) channels: *mut *const f32,
-    pub(crate) owned: Option<NonNull<f32>>,
-    pub(crate) value: f32,
+use util::array::Array;
+
+use crate::NO_CONSTANT_VALUE;
+
+pub struct Arena {
+    slab: *mut f32,
+    max_num_channels: usize,
+    max_num_frames: usize,
+    stack: util::Stack<*mut f32>,
 }
 
-#[repr(C)]
-pub struct AudioMut {
-    pub(crate) num_channels: usize,
-    pub(crate) num_frames: usize,
-    pub(crate) channels: *mut *mut f32,
-    pub(crate) owned: Option<NonNull<f32>>,
-    pub(crate) value: f32,
+pub struct Audio {
+    pub num_channels: u32,
+    pub num_frames: u32,
+    pub value: f32,
+    pub channels: Array<*mut f32>,
 }
 
 pub struct AudioIter<'a> {
@@ -53,62 +45,125 @@ pub struct AudioIterMut<'a> {
     _p: PhantomData<&'a ()>,
 }
 
-impl Audio {
-    /// Create a new (owned) buffer of immutable audio data. You almost certainly want to use [AudioMut] instead.
-    pub fn new(num_channels: usize, num_frames: usize) -> Self {
-        let (channels, owned) = unsafe {
-            let layout = std::alloc::Layout::from_size_align_unchecked(
-                num_channels * num_frames * std::mem::size_of::<f32>(),
-                std::mem::align_of::<f32>(),
-            );
-            let ptr = std::alloc::alloc_zeroed(layout).cast();
-            let owned = NonNull::new(ptr);
+impl Arena {
+    /// Create a new audio buffer allocator.
+    pub fn new(max_num_channels: usize, max_num_frames: usize) -> Self {
+        // Maximum number of frames must be divisible by 4.
+        debug_assert!(
+            max_num_frames % 4 == 0,
+            "max_num_frames must be a multiple of 4 for proper alignment"
+        );
 
+        // Allocate the slab.
+        let slab: *mut f32 = unsafe {
             let layout = std::alloc::Layout::from_size_align_unchecked(
-                num_channels * std::mem::size_of::<*const f32>(),
-                std::mem::align_of::<*const f32>(),
+                max_num_channels * max_num_frames * std::mem::size_of::<f32>(),
+                16,
             );
-            let channels = std::alloc::alloc(layout).cast();
-            (channels, owned)
+            std::alloc::alloc_zeroed(layout).cast()
         };
+        debug_assert!(!slab.is_null());
+
+        // Allocate the stack.
+        let mut stack = util::Stack::new(max_num_channels);
+
+        // Fill the stack.
+        for idx in 0..max_num_channels {
+            let channel = unsafe { slab.add(idx * max_num_frames) };
+            stack.push(channel);
+        }
+
         Self {
-            num_channels,
-            num_frames,
-            channels,
-            owned,
-            value: f32::NAN,
+            slab,
+            stack,
+            max_num_channels,
+            max_num_frames,
         }
     }
 
-    /// Create a new non-owned buffer of immutable audio data.
-    ///
-    /// Safety: the caller is responsible for calling [Audio::bind] and [Audio::set_num_frames] in
-    /// order to fully initialize the data. This interface exists to create an audio buffer whose
-    /// underlying pointers are mapped lazily or updated without allocation.
-    pub unsafe fn non_owned(num_channels: usize) -> Self {
-        let channels = unsafe {
+    pub unsafe fn realloc(&mut self, max_num_channels: usize, max_num_frames: usize) {
+        let slab: *mut f32 = unsafe {
             let layout = std::alloc::Layout::from_size_align_unchecked(
-                num_channels * std::mem::size_of::<*const f32>(),
-                std::mem::align_of::<*const f32>(),
+                self.max_num_channels * self.max_num_frames * std::mem::size_of::<f32>(),
+                16,
             );
-            std::alloc::alloc(layout).cast()
+            std::alloc::realloc(
+                self.slab.cast(),
+                layout,
+                max_num_channels * max_num_frames * std::mem::size_of::<f32>(),
+            )
+            .cast()
         };
+        debug_assert!(!slab.is_null());
+        self.slab = slab;
+        self.max_num_channels = self.max_num_channels;
+        self.max_num_frames = self.max_num_frames;
+        unsafe { self.reset() };
+    }
+
+    fn alloc(&mut self) -> Option<NonNull<f32>> {
+        self.stack
+            .pop()
+            .map(|ptr| unsafe { NonNull::new_unchecked(ptr) })
+    }
+
+    fn dealloc(&mut self, ptr: *mut f32) {
+        self.stack.push(ptr);
+    }
+
+    pub fn acquire(&mut self, audio: &mut Audio) -> bool {
+        for idx in 0..audio.num_channels {
+            let Some(channel) = self.alloc() else {
+                return false;
+            };
+            audio.channels[idx] = channel.as_ptr();
+        }
+        true
+    }
+
+    pub fn release(&mut self, audio: &mut Audio) {
+        for idx in 0..audio.num_channels {
+            self.dealloc(audio.channels[idx]);
+        }
+    }
+
+    pub unsafe fn reset(&mut self) {
+        self.stack.clear();
+        for idx in 0..self.max_num_channels {
+            let channel = unsafe { self.slab.add(idx * self.max_num_frames) };
+            self.stack.push(channel);
+        }
+    }
+}
+
+impl Audio {
+    /// Create a new non-owned buffer of immutable audio data.
+    pub fn new(num_channels: u32) -> Self {
+        let channels = Array::from(vec![null_mut(); num_channels.try_into().unwrap()]);
         Self {
             num_channels,
             num_frames: 0,
             channels,
-            owned: None,
-            value: f32::NAN,
+            value: NO_CONSTANT_VALUE,
         }
     }
 
+    pub unsafe fn from_raw(channels: *const *mut f32, num_channels: u32, num_frames: u32) -> Self {
+        let mut this = Self::new(num_channels);
+        this.num_frames = num_frames;
+        for i in 0..num_channels {
+            this.channels[i] = unsafe { *channels.add(i.try_into().unwrap()) };
+        }
+        this
+    }
+
     /// Get the number of channels in the buffer.
-    pub fn num_channels(&self) -> usize {
+    pub fn num_channels(&self) -> u32 {
         self.num_channels
     }
 
     /// Return the number of frames per channel.
-    pub fn num_frames(&self) -> usize {
+    pub fn num_frames(&self) -> u32 {
         self.num_frames
     }
 
@@ -120,20 +175,25 @@ impl Audio {
 
     /// Unset the constant value.
     pub fn clear_constant_value(&mut self) {
-        self.value = f32::NAN;
+        self.value = NO_CONSTANT_VALUE;
     }
 
     /// Update the number of frames in the buffer.
-    ///
-    /// Safety: this is only valid with a non-owned buffer.
-    pub unsafe fn set_num_frames(&mut self, num_frames: usize) {
-        debug_assert!(self.owned.is_none());
+    pub fn set_num_frames(&mut self, num_frames: u32) {
         self.num_frames = num_frames;
     }
 
+    pub fn set_num_channels(&mut self, num_channels: u32) {
+        self.num_channels = num_channels;
+    }
+
     /// Return the raw channel pointers.
-    pub unsafe fn raw(&self) -> *const *const f32 {
-        self.channels
+    pub fn raw(&self) -> *const *const f32 {
+        self.channels.as_ptr().cast()
+    }
+
+    pub fn raw_mut(&mut self) -> *mut *mut f32 {
+        self.channels.as_mut_ptr()
     }
 
     /// Get the constant value.
@@ -141,184 +201,76 @@ impl Audio {
         (!self.value.is_nan()).then_some(self.value)
     }
 
-    /// Update the underlying channel pointers.
-    /// Safety: This method is only valid on non-owned buffers. The number of values in the iterator
-    /// must match the number of channels in the buffer.
-    pub unsafe fn bind(&mut self, ptrs: impl Iterator<Item = *const f32>) {
-        debug_assert!(self.owned.is_none());
-        for (offset, ptr) in ptrs.into_iter().enumerate() {
-            debug_assert!(offset < self.num_channels);
-            unsafe {
-                *self.channels.add(offset) = ptr;
-            }
-        }
-    }
-
     /// Iterate channels.
     pub fn iter(&self) -> AudioIter<'_> {
         AudioIter {
-            channels: self.channels,
-            num_channels: self.num_channels,
-            num_frames: self.num_frames,
-            _p: PhantomData::default(),
-        }
-    }
-}
-
-impl AudioMut {
-    pub fn new(num_channels: usize, num_frames: usize) -> Self {
-        let (channels, owned) = unsafe {
-            let layout = std::alloc::Layout::from_size_align_unchecked(
-                num_channels * num_frames * std::mem::size_of::<f32>(),
-                std::mem::align_of::<f32>(),
-            );
-            let ptr = std::alloc::alloc_zeroed(layout).cast();
-            let owned = NonNull::new(ptr);
-
-            let layout = std::alloc::Layout::from_size_align_unchecked(
-                num_channels * num_frames * std::mem::size_of::<*mut f32>(),
-                std::mem::align_of::<*mut f32>(),
-            );
-            let channels = std::alloc::alloc(layout).cast();
-            (channels, owned)
-        };
-        Self {
-            num_channels,
-            num_frames,
-            channels,
-            owned,
-            value: f32::NAN,
-        }
-    }
-
-    pub unsafe fn non_owned(num_channels: usize) -> Self {
-        let channels = unsafe {
-            let layout = std::alloc::Layout::from_size_align_unchecked(
-                num_channels * std::mem::size_of::<*mut f32>(),
-                std::mem::align_of::<*mut f32>(),
-            );
-            std::alloc::alloc(layout).cast()
-        };
-        Self {
-            num_channels,
-            num_frames: 0,
-            channels,
-            owned: None,
-            value: f32::NAN,
-        }
-    }
-
-    pub fn num_frames(&self) -> usize {
-        self.num_frames
-    }
-
-    pub fn num_channels(&self) -> usize {
-        self.num_channels
-    }
-
-    pub fn set_constant_value(&mut self, value: f32) {
-        debug_assert!(!value.is_nan(), "cannot set a constant to be NaN");
-        self.value = value;
-    }
-
-    pub fn set_num_frames(&mut self, num_frames: usize) {
-        self.num_frames = num_frames;
-    }
-
-    /// Return the raw pointers.
-    pub fn raw(&self) -> *const *mut f32 {
-        self.channels
-    }
-
-    /// Return a constant value for the whole buffer, if it exists.
-    pub fn constant_value(&self) -> Option<f32> {
-        (!self.value.is_nan()).then_some(self.value)
-    }
-
-    /// Bind channels to pointers.
-    pub unsafe fn bind(&mut self, ptrs: impl Iterator<Item = *mut f32>) {
-        debug_assert!(self.owned.is_none());
-        for (offset, ptr) in ptrs.into_iter().enumerate() {
-            debug_assert!(offset < self.num_channels);
-            unsafe {
-                *self.channels.add(offset) = ptr;
-            }
-        }
-    }
-
-    pub fn iter(&self) -> AudioIter<'_> {
-        AudioIter {
-            channels: self.channels.cast(),
-            num_frames: self.num_frames,
-            num_channels: self.num_channels,
+            channels: self.raw(),
+            num_channels: self.num_channels.try_into().unwrap(),
+            num_frames: self.num_frames.try_into().unwrap(),
             _p: PhantomData::default(),
         }
     }
 
-    pub fn iter_mut(&self) -> AudioIterMut<'_> {
+    pub fn iter_mut(&mut self) -> AudioIterMut<'_> {
         AudioIterMut {
-            channels: self.channels,
-            num_frames: self.num_frames,
-            num_channels: self.num_channels,
+            channels: self.raw_mut(),
+            num_channels: self.num_channels.try_into().unwrap(),
+            num_frames: self.num_frames.try_into().unwrap(),
             _p: PhantomData::default(),
         }
     }
+
+    pub fn assign_to(&mut self, other: &Self) {
+        debug_assert!(self.channels.len() <= other.channels.len());
+        let len = self.channels.len().min(other.channels.len());
+        self.num_channels = other.num_channels;
+        self.num_frames = other.num_frames;
+        self.channels.as_mut_slice()[0..len].copy_from_slice(&other.channels.as_slice()[0..len]);
+    }
 }
 
-impl Drop for Audio {
+impl Drop for Arena {
     fn drop(&mut self) {
         unsafe {
             let layout = std::alloc::Layout::from_size_align_unchecked(
-                self.num_channels * std::mem::size_of::<*const f32>(),
-                std::mem::align_of::<*const f32>(),
+                self.max_num_channels * self.max_num_frames * std::mem::size_of::<f32>(),
+                16,
             );
-            std::alloc::dealloc(self.channels.cast(), layout);
+            std::alloc::dealloc(self.slab.cast(), layout);
         }
     }
 }
 
-impl Drop for AudioMut {
-    fn drop(&mut self) {
-        unsafe {
-            let layout = std::alloc::Layout::from_size_align_unchecked(
-                self.num_channels * std::mem::size_of::<*const f32>(),
-                std::mem::align_of::<*const f32>(),
-            );
-            std::alloc::dealloc(self.channels.cast(), layout);
-        }
-    }
-}
-
-impl Index<usize> for Audio {
+impl<Idx> Index<Idx> for Audio
+where
+    Idx: TryInto<u32>,
+{
     type Output = [f32];
-    fn index(&self, index: usize) -> &Self::Output {
+    fn index(&self, index: Idx) -> &Self::Output {
+        let Ok(index) = index.try_into() else {
+            unreachable!()
+        };
         debug_assert!(index < self.num_channels);
         unsafe {
-            let ptr = *self.channels.add(index);
-            let len = self.num_frames;
+            let ptr = *self.raw().add(index.try_into().unwrap());
+            let len = self.num_frames.try_into().unwrap();
             std::slice::from_raw_parts(ptr, len)
         }
     }
 }
 
-impl Index<usize> for AudioMut {
-    type Output = [f32];
-    fn index(&self, index: usize) -> &Self::Output {
+impl<Idx> IndexMut<Idx> for Audio
+where
+    Idx: TryInto<u32>,
+{
+    fn index_mut(&mut self, index: Idx) -> &mut Self::Output {
+        let Ok(index) = index.try_into() else {
+            unreachable!()
+        };
         debug_assert!(index < self.num_channels);
         unsafe {
-            let ptr = *self.channels.add(index);
-            let len = self.num_frames;
-            std::slice::from_raw_parts(ptr, len)
-        }
-    }
-}
-
-impl IndexMut<usize> for AudioMut {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        debug_assert!(index < self.num_channels);
-        unsafe {
-            let ptr = *self.channels.add(index);
-            let len = self.num_frames;
+            let ptr = *self.raw_mut().add(index.try_into().unwrap());
+            let len = self.num_frames.try_into().unwrap();
             std::slice::from_raw_parts_mut(ptr, len)
         }
     }
@@ -332,15 +284,7 @@ impl<'a> IntoIterator for &'a Audio {
     }
 }
 
-impl<'a> IntoIterator for &'a AudioMut {
-    type IntoIter = AudioIter<'a>;
-    type Item = &'a [f32];
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
-}
-
-impl<'a> IntoIterator for &'a mut AudioMut {
+impl<'a> IntoIterator for &'a mut Audio {
     type IntoIter = AudioIterMut<'a>;
     type Item = &'a mut [f32];
     fn into_iter(self) -> Self::IntoIter {
@@ -372,23 +316,4 @@ impl<'a> Iterator for AudioIterMut<'a> {
     }
 }
 
-impl AsRef<Audio> for AudioMut {
-    fn as_ref(&self) -> &Audio {
-        unsafe { std::mem::transmute(self) }
-    }
-}
-
 unsafe impl Send for Audio {}
-unsafe impl Send for AudioMut {}
-
-impl Into<Audio> for AudioMut {
-    fn into(self) -> Audio {
-        unsafe { std::mem::transmute(self) }
-    }
-}
-
-impl Into<AudioMut> for Audio {
-    fn into(self) -> AudioMut {
-        unsafe { std::mem::transmute(self) }
-    }
-}

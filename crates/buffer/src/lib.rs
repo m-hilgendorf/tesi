@@ -1,7 +1,7 @@
 use core::f32;
 pub mod audio;
 pub mod event;
-pub use audio::{Audio, AudioMut};
+pub use audio::Audio;
 pub use event::Event;
 
 /// https://github.com/rust-lang/rust/issues/72447
