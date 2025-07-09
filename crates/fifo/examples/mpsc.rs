@@ -1,4 +1,4 @@
-use tesi_fifo::fifo;
+use tesi_fifo::channel;
 
 // This example shows how to use a FIFO to synchronize an arbitary number of producer threads with a single consumer thread.
 fn main() {
@@ -8,7 +8,7 @@ fn main() {
     let mut readers = Vec::with_capacity(num_producers);
     let mut writers = Vec::with_capacity(num_producers);
     for _ in 0..num_producers {
-        let (writer, reader) = fifo::<u8>(capacity, || 0);
+        let (writer, reader) = channel::<u8>(capacity, None, || 0);
         readers.push(reader);
         writers.push(writer);
     }

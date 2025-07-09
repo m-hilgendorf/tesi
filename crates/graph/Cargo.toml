@@ -4,7 +4,8 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-batchbuffer =  { workspace = true }
 buffer = { workspace = true }
+fifo =  { workspace = true }
 util = { workspace = true }
 processor = { workspace = true }
+triple_buffer = { workspace = true }

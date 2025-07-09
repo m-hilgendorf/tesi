@@ -1,23 +1,51 @@
 use processor::{Direction, Processor};
+use triple_buffer::{TripleBuffer};
+use util::collections::BitSet;
 use std::{
     cell::{RefCell, UnsafeCell},
     collections::BTreeSet,
     rc::Rc,
-    sync::{atomic::AtomicBool, Arc},
+    sync::Arc,
 };
 
 pub use crate::edge::Edge;
-use crate::error::Error;
+use crate::{error::Error, render::single_threaded::{self, Renderer}};
 pub use crate::node::{self, Node};
+
+type Channel = fifo::Receiver<RenderMessage>;
+
+pub fn graph(
+    _global_ports: Vec<processor::Port>,
+) -> (Graph, Renderer) {
+    let (sender, receiver) = fifo::channel(16_384, None, || RenderMessage::Nop);
+    let (input, output) = TripleBuffer::default().split();
+    let renderer = Renderer {
+        state: output,
+        channel: sender,
+    };
+    let inner = Inner {
+        nodes: Vec::new(),
+        free_list: Vec::new(),
+        channel: receiver,
+        state: input,
+    };
+    let graph = Graph {
+        inner: Rc::new(RefCell::new(inner)),
+    };
+    (graph, renderer)
+}
 
 pub struct Graph {
     pub(crate) inner: Rc<RefCell<Inner>>,
 }
 
 pub(crate)struct Inner {
+    pub(crate) sample_rate: f64,
+    pub(crate) max_buffer_size: usize,
     pub(crate) nodes: Vec<Option<NodeData>>,
     pub(crate) free_list: Vec<usize>,
-    pub(crate) reader: batchbuffer::Reader<RenderMessage>,
+    pub(crate) channel: Channel,
+    pub(crate) state: triple_buffer::Input<Option<single_threaded::State>>,
 }
 
 pub(crate) struct NodeData {
@@ -40,15 +68,41 @@ pub(crate) enum RenderMessage {
 
 impl Graph {
     pub fn latency_changed(&self) {
-
-    }
-
-    pub fn needs_reactivate(&self) {
-
+        todo!("latency changes")
     }
 
     /// Propagate changes to the graph (new or removed [Node]s and [Edge]s)
     pub fn commit_changes(&self) {
+        let this = self.inner.borrow();
+        let mut visited = BitSet::with_capacity(this.nodes.len());
+        let mut stack = vec![0];
+
+        // Sort.
+        let mut nodes = Vec::with_capacity(this.nodes.len());
+        while let Some(index) = stack.pop() {
+            if visited.get(index) {
+                continue;
+            }
+            visited.set(index);
+            let data = this.nodes[index].as_ref().unwrap();
+            nodes.push(single_threaded::Node {
+                processor: data.clone(),
+                active: todo!(),
+                ports: todo!(),
+                audio_inputs: todo!(),
+                audio_outputs: todo!(),
+                event_inputs: todo!(),
+                event_outputs: todo!(),
+            })
+        }
+
+        let mut state = single_threaded::State {
+            sample_rate: self.sample_rate,
+            max_num_frames: self.max_num_frames,
+            nodes,
+            audio_arena,
+            event_arena,
+        };
         todo!()
     }
 }

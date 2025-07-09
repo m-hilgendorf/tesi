@@ -1,40 +1,34 @@
 use std::ptr::null_mut;
-
-use util::Stack;
+use util::collections::Stack;
 
 pub struct Arena {
-    events: *mut u8, /* event buffer  */
-    entries: *mut Entry, /* entry buffer */
+    events: *mut u8,                     /* event buffer  */
+    entries: *mut Entry,                 /* entry buffer */
     stack: Stack<(*mut u8, *mut Entry)>, /* stack of free items */
-    size: u32, /* size of each event */
-    align: u32, /* alignment of each event */
+    size: u32,                           /* size of each event */
+    align: u32,                          /* alignment of each event */
     max_num_ports: u32, /* the max number of event ports that need to be supported concurrently */
     max_num_events: u32, /* the max number of events in one buffer */
 }
 
 pub struct Event {
-    pub size: u32,
-    pub align: u32,
-    pub length: u32,
-    pub capacity: u32,
-    pub entries: *mut Entry,
-    pub events: *mut u8,
+    pub size: u32,           /* the size of each event */
+    pub align: u32,          /* the alignment of each event */
+    pub length: u32,         /* the number of events in this buffer */
+    pub capacity: u32,       /* the total capacity of this buffer */
+    pub entries: *mut Entry, /* the event offsets */
+    pub events: *mut u8,     /* the raw event data */
 }
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct Entry {
-    pub offset: u32,
-    pub length: u32,
-    pub time: u32,
+    pub offset: u32, /* offset from the start of the buffer, in bytes */
+    pub length: u32, /* length of the event, in bytes */
+    pub time: u32,   /* offset from the start of the buffer, in frames */
 }
 
 impl Arena {
-    pub fn new(
-        max_num_ports: u32,
-        max_num_events: u32,
-        event_align: u32,
-        event_size: u32,
-    ) -> Self {
+    pub fn new(max_num_ports: u32, max_num_events: u32, event_align: u32, event_size: u32) -> Self {
         let aligned_event_size = if event_size % event_align == 0 {
             event_size
         } else {
@@ -86,7 +80,7 @@ impl Arena {
         true
     }
 
-    pub fn release(&mut self, buffer: &mut Event)  {
+    pub fn release(&mut self, buffer: &mut Event) {
         self.dealloc((buffer.events, buffer.entries));
         buffer.events = null_mut();
         buffer.entries = null_mut();
@@ -111,8 +105,14 @@ impl Arena {
         };
         for idx in 0..self.max_num_ports {
             unsafe {
-                let event = self.events.add((idx * self.max_num_events * aligned_event_size).try_into().unwrap());
-                let entry = self.entries.add((idx * self.max_num_events).try_into().unwrap());
+                let event = self.events.add(
+                    (idx * self.max_num_events * aligned_event_size)
+                        .try_into()
+                        .unwrap(),
+                );
+                let entry = self
+                    .entries
+                    .add((idx * self.max_num_events).try_into().unwrap());
                 self.stack.push((event, entry));
             }
         }
@@ -133,7 +133,7 @@ impl Drop for Arena {
                 .expect("invalid event size and alignment");
             std::alloc::dealloc(self.events.cast(), layout);
 
-            let size =  (capacity as usize) * std::mem::size_of::<Entry>();
+            let size = (capacity as usize) * std::mem::size_of::<Entry>();
             let align = std::mem::align_of::<Entry>();
             let layout = std::alloc::Layout::from_size_align_unchecked(size, align);
             std::alloc::dealloc(self.entries.cast(), layout);
@@ -149,7 +149,7 @@ impl Event {
             length: 0,
             capacity: 0,
             entries: null_mut(),
-            events: null_mut()
+            events: null_mut(),
         }
     }
 

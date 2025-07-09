@@ -13,7 +13,7 @@ use std::{
     ptr::{NonNull, null_mut},
 };
 
-use util::array::Array;
+use util::collections::{Array, Stack};
 
 use crate::NO_CONSTANT_VALUE;
 
@@ -21,7 +21,7 @@ pub struct Arena {
     slab: *mut f32,
     max_num_channels: usize,
     max_num_frames: usize,
-    stack: util::Stack<*mut f32>,
+    stack: Stack<*mut f32>,
 }
 
 pub struct Audio {
@@ -65,7 +65,7 @@ impl Arena {
         debug_assert!(!slab.is_null());
 
         // Allocate the stack.
-        let mut stack = util::Stack::new(max_num_channels);
+        let mut stack = Stack::new(max_num_channels);
 
         // Fill the stack.
         for idx in 0..max_num_channels {

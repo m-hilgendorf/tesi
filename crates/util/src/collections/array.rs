@@ -1,5 +1,6 @@
-use std::{ops::{Deref, DerefMut, Index, IndexMut, Range}, ptr::NonNull};
+use std::{ops::{Deref, DerefMut, Index, IndexMut}};
 
+#[repr(transparent)]
 pub struct Array<T> {
     inner: Box<[T]>,
 }

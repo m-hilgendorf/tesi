@@ -1,10 +1,13 @@
-use processor::{context, port::Kind, Direction, Processor as _};
-use std::{cell::UnsafeCell, ops::DerefMut, sync::Arc};
+use processor::{context, port::Kind, processor::Processed, Direction};
+use util::collections::Array;
+use std::{cell::UnsafeCell, sync::Arc};
 
-use crate::graph::{self, RenderMessage};
+use crate::graph::RenderMessage;
+type Channel = fifo::Sender<RenderMessage>;
 
 pub struct Renderer {
-    state: util::swappable::Reader<State>,
+    pub(crate) state: triple_buffer::Output<Option<State>>,
+    pub(crate) channel: fifo::Sender<RenderMessage>,
 }
 
 pub(crate) struct State {
@@ -13,14 +16,14 @@ pub(crate) struct State {
     pub max_num_frames: usize,
 
     // The list of nodes to process, in topological order.
-    pub nodes: util::array::Array<Node>,
+    pub nodes: Array<Node>,
 
     // Audio/event buffer allocators.
     pub audio_arena: buffer::audio::Arena,
     pub event_arena: buffer::event::Arena,
-
-    pub writer: batchbuffer::Writer<RenderMessage>,
 }
+
+unsafe impl Send for State {}
 
 pub(crate) struct Node {
     pub processor: Arc<UnsafeCell<dyn processor::Processor>>,
@@ -32,10 +35,10 @@ pub(crate) struct Node {
     pub ports: Box<[Port]>,
 
     // Scratch space for creating contexts.
-    pub audio_inputs: Box<[buffer::Audio]>,
-    pub audio_outputs: Box<[buffer::Audio]>,
-    pub event_inputs: Box<[buffer::Event]>,
-    pub event_outputs: Box<[buffer::Event]>,
+    pub audio_inputs: Array<buffer::Audio>,
+    pub audio_outputs: Array<buffer::Audio>,
+    pub event_inputs: Array<buffer::Event>,
+    pub event_outputs: Array<buffer::Event>,
 }
 
 pub(crate) struct Port {
@@ -51,8 +54,12 @@ impl Renderer {
         output: &mut buffer::Audio,
      ) {
         debug_assert!(input.num_frames == output.num_frames, "i/o size mismatch");
-        let num_frames = input.num_frames;
-        let mut state = self.state.read();
+    let num_frames = input.num_frames;
+        // Update state.
+        self.state.update();
+        let Some(state) = self.state.output_buffer_mut() else {
+            return;
+        };
 
         // Bind the root i/o.
         let root = &mut state.nodes[0];
@@ -61,28 +68,26 @@ impl Renderer {
 
         // Process nodes.
         for index in 0..state.nodes.len() {
-            state.process_node(index, num_frames);
+            // Process the node.
+            let result = state.process_node(index, num_frames);
+
+            // Deactivate nodes that are finished.
+            match result.state {
+                processor::processor::State::Continue => (),
+                processor::processor::State::Finished => {
+                    // Deactivate the node.
+                    state.nodes[index].active = false;
+
+                    // Post the node deactivation.
+                    post_message(&mut self.channel, RenderMessage::RemoveNode(index as _));
+                }
+            }
         }
     }
 }
 
 impl State {
-    fn post_message(&mut self, msg: RenderMessage) {
-        loop {
-            let Some(mut txn) = self.writer.write(1) else {
-                return;
-            };
-            if txn.len() == 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            txn[0] = msg;
-            txn.commit();
-            break;
-        }
-    }
-
-    fn process_node(&mut self, index: usize, num_frames: u32) {
+    fn process_node(&mut self, index: usize, num_frames: u32) -> Processed {
         let Self {
             sample_rate,
             nodes,
@@ -92,10 +97,13 @@ impl State {
 
         // Skip processing inactive nodes.
         if !node.active {
-            for outp in &mut node.audio_outputs {
+            for outp in node.audio_outputs.as_mut_slice() {
                 outp.set_constant_value(0.0);
             }
-            return;
+            return Processed {
+                state: processor::processor::State::Continue,
+                tail_frames: None,
+            }
         }
 
         // Create the context.
@@ -113,18 +121,10 @@ impl State {
             (*node.processor.get()).process(context)
         };
 
-        // TODO: tail frames.
-
-        // Deactivate nodes that are finished.
-        match result.state {
-            processor::processor::State::Continue => (),
-            processor::processor::State::Finished => {
-                node.active = false;
-                self.post_message(RenderMessage::RemoveNode(index as _));
-            }
-        }
+        result
     }
 
+    // Assign i/o buffers.
     pub fn assign_buffers(&mut self) {
         for index in 1..self.nodes.len() {
             self.acquire_outputs(index);
@@ -183,5 +183,19 @@ impl State {
                 event_arena.release(&mut node.event_inputs[idx]);
             });
     }
+}
 
+fn post_message(channel: &mut Channel, msg: RenderMessage) {
+    loop {
+        let Some(mut txn) = channel.write(1) else {
+            return;
+        };
+        if txn.len() == 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        txn[0] = msg;
+        txn.commit();
+        break;
+    }
 }

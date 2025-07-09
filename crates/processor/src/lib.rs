@@ -1,3 +1,4 @@
+pub mod builtin;
 pub mod editor;
 pub mod port;
 pub mod processor;
